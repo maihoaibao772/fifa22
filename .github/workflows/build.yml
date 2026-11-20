@@ -1,0 +1,164 @@
+name: Build FIFA 22 Miao (A16)
+
+on:
+  workflow_dispatch:
+    inputs:
+      split_romfs:
+        description: "Tách riêng RomFS.img (bắt buộc cho FIFA 22 vì >13GB)"
+        type: boolean
+        default: true
+      upload_romfs:
+        description: "Upload FIFA22_romfs_miao.zip lên Gofile"
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: xcode-27
+    steps:
+      - name: Cài công cụ build
+        run: |
+          brew install xcodegen zstd spirv-cross glslang jq
+          brew install --cask dotnet-sdk
+          xcodebuild -downloadComponent MetalToolchain || true
+
+      - name: Tải source fifa22-nxnative
+        run: |
+          git clone --depth 1 https://github.com/Jeb0978/fifa22-nxnative.git src
+
+      - name: Thêm credit Port by Miaomiaocutene lên Launcher
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("src/dm/ios/Sources/Launcher.swift")
+          txt = p.read_text(encoding="utf-8")
+          anchor = 'if #available(iOS 26.0, *) { button.buttonStyle(.glassProminent) } else { button.buttonStyle(.borderedProminent) }'
+          credit = '        Text("Port by Miaomiaocutene").font(.caption).foregroundStyle(.secondary)'
+          if anchor in txt and "Port by Miaomiaocutene" not in txt:
+              txt = txt.replace(anchor, anchor + "\n" + credit, 1)
+              p.write_text(txt, encoding="utf-8")
+              print("[OK] Đã thêm credit vào Launcher.swift")
+          else:
+              print("[WARN] Không tìm thấy anchor hoặc đã có sẵn credit")
+          PY
+
+      - name: Cài thư viện Python & công cụ tải
+        working-directory: src
+        run: |
+          python3 -m venv .venv
+          source .venv/bin/activate
+          python3 -m pip install gdown requests lz4 "capstone>=5,<6" fonttools zbic "backports.zstd; python_version < '3.14'"
+
+      - name: Tải Game & prod.keys (Gofile / Drive / Pixeldrain)
+        env:
+          GAME_URL: ${{ secrets.Game_URL }}
+          KEYS_URL: ${{ secrets.Keys_URL }}
+          UPDATE_URL: ${{ secrets.Update_URL }}
+        run: |
+          mkdir -p game_files keys out_ipa
+          GDOWN="$PWD/src/.venv/bin/gdown"
+          GF_PY="$PWD/src/.venv/bin/python"
+
+          download_file() {
+            local url="$1"
+            local out_dir="$2"
+            local fixed_name="$3"
+
+            if [[ "$url" == *"gofile.io/"* ]]; then
+              if [ ! -f /tmp/gf/gofile-downloader.py ]; then
+                git clone --depth 1 https://github.com/ltsdw/gofile-downloader.git /tmp/gf
+              fi
+              (cd "$out_dir" && "$GF_PY" /tmp/gf/gofile-downloader.py "$url")
+              if [ -n "$fixed_name" ]; then
+                local got
+                got=$(find "$out_dir" -maxdepth 1 -type f | head -n 1)
+                if [ -n "$got" ] && [ "$(basename "$got")" != "$fixed_name" ]; then
+                  mv "$got" "${out_dir}/${fixed_name}"
+                fi
+              fi
+            elif [[ "$url" == *"pixeldrain.com/u/"* ]]; then
+              local pid
+              pid=$(echo "$url" | sed -E 's|.*pixeldrain\.com/u/([^/?#]+).*|\1|')
+              if [ -n "$fixed_name" ]; then
+                curl -fL "https://pixeldrain.com/api/file/${pid}?download" -o "${out_dir}/${fixed_name}"
+              else
+                (cd "$out_dir" && curl -fL -J -O "https://pixeldrain.com/api/file/${pid}?download")
+              fi
+            elif [[ "$url" == *"drive.google.com"* ]] || [[ "$url" == *"docs.google.com"* ]]; then
+              if [ -n "$fixed_name" ]; then
+                "$GDOWN" "$url" -O "${out_dir}/${fixed_name}"
+              else
+                (cd "$out_dir" && "$GDOWN" "$url")
+              fi
+            else
+              if [ -n "$fixed_name" ]; then
+                curl -fL "$url" -o "${out_dir}/${fixed_name}"
+              else
+                (cd "$out_dir" && curl -fL -J -O "$url")
+              fi
+            fi
+          }
+
+          download_file "$KEYS_URL" "keys" "prod.keys"
+          download_file "$GAME_URL" "game_files" ""
+          if [ -n "$UPDATE_URL" ]; then
+            download_file "$UPDATE_URL" "game_files" ""
+          fi
+          ls -lh keys game_files
+
+      - name: Build FIFA22_miao.ipa
+        working-directory: src
+        run: |
+          source .venv/bin/activate
+          EXTRA_ARGS=""
+          if [ "${{ inputs.split_romfs }}" = "true" ]; then
+            EXTRA_ARGS="--romfs separate"
+          fi
+
+          python3 scripts/build_ipa_from_nsp.py ../game_files -k ../keys/prod.keys --allow-other-metal $EXTRA_ARGS -o ../out_ipa/FIFA22_miao.ipa
+
+          python3 - <<'PY'
+          import plistlib, zipfile, shutil
+          from pathlib import Path
+          ipa = Path("../out_ipa/FIFA22_miao.ipa")
+          tmp = Path("../out_ipa/FIFA22_miao_tmp.ipa")
+          with zipfile.ZipFile(ipa, "r") as zn:
+              plist_path = next(p for p in zn.namelist() if p.endswith(".app/Info.plist"))
+              plist = plistlib.loads(zn.read(plist_path))
+              plist["NSHumanReadableCopyright"] = "Port by Miaomiaocutene"
+              with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zo:
+                  for item in zn.infolist():
+                      if item.filename == plist_path:
+                          zo.writestr(item, plistlib.dumps(plist, fmt=plistlib.FMT_BINARY))
+                      else:
+                          zo.writestr(item, zn.read(item.filename))
+          shutil.move(tmp, ipa)
+          PY
+
+          ROMFS_IMG=$(find ../game_files -name "RomFS.img" -type f | head -n 1)
+          if [ "${{ inputs.split_romfs }}" = "true" ] && [ "${{ inputs.upload_romfs }}" = "true" ] && [ -n "$ROMFS_IMG" ]; then
+            cp "$ROMFS_IMG" /tmp/romfs.img
+            zip -0 -j ../out_ipa/FIFA22_romfs_miao.zip /tmp/romfs.img
+            rm -f /tmp/romfs.img
+          fi
+
+      - name: Upload lên Gofile để tải nhanh
+        run: |
+          SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')
+          echo "### Link tải FIFA 22 - Port by Miaomiaocutene" >> "$GITHUB_STEP_SUMMARY"
+          for f in out_ipa/*; do
+            if [ -f "$f" ]; then
+              RES=$(curl -s -F "file=@$f" "https://${SERVER}.gofile.io/contents/uploadfile")
+              LINK=$(echo "$RES" | jq -r '.data.downloadPage')
+              NAME=$(basename "$f")
+              echo ">>> $NAME: $LINK"
+              echo "- **$NAME**: $LINK" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+      - name: Lưu dự phòng IPA ở Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: FIFA22_miao-ipa
+          path: out_ipa/FIFA22_miao.ipa
+          retention-days: 3
