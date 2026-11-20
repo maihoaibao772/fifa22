@@ -28,9 +28,26 @@ jobs:
           brew install xcodegen zstd spirv-cross glslang jq
           xcodebuild -downloadComponent MetalToolchain || true
 
-      - name: Tải source fifa22-nxnative
+      - name: Tải source fifa22-nxnative & cấp quyền thực thi
         run: |
           git clone --depth 1 https://github.com/Jeb0978/fifa22-nxnative.git src
+          chmod +x src/dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate
+          if [ -f src/dm/gfx/tools/spirv_cross_bin/spirv-cross ]; then
+            chmod +x src/dm/gfx/tools/spirv_cross_bin/spirv-cross
+          fi
+          if [ -f src/dm/tools/nx_extract_bin/nx_extract ]; then
+            chmod +x src/dm/tools/nx_extract_bin/nx_extract
+          fi
+          find src -type f -name "*.sh" -exec chmod +x {} +
+
+      - name: Kiểm tra nhanh tool & profile trước khi tải game (tiết kiệm thời gian)
+        working-directory: src
+        run: |
+          ./dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate --source-sha
+          if [ -f ./dm/gfx/tools/spirv_cross_bin/spirv-cross ]; then
+            ./dm/gfx/tools/spirv_cross_bin/spirv-cross --version || true
+          fi
+          ls -la "$PWD/fifa-build-profile"
 
       - name: Thêm credit Port by Miaomiaocutene lên Launcher
         run: |
@@ -53,6 +70,9 @@ jobs:
         run: |
           python3 -m venv .venv
           source .venv/bin/activate
+          if [ -f .github/requirements/tools.txt ]; then
+            python3 -m pip install -r .github/requirements/tools.txt
+          fi
           python3 -m pip install gdown requests lz4 "capstone>=5,<6" fonttools zbic "backports.zstd; python_version < '3.14'"
 
       - name: Tải Game & prod.keys (Gofile / Drive / Pixeldrain)
@@ -124,7 +144,12 @@ jobs:
             EXTRA_ARGS="--romfs separate"
           fi
 
-          python3 scripts/build_ipa_from_nsp.py ../game_files -k ../keys/prod.keys --allow-other-metal $EXTRA_ARGS -o ../out_ipa/FIFA22_miao.ipa
+          python3 scripts/build_ipa_from_nsp.py ../game_files \
+            -k ../keys/prod.keys \
+            --profile-out "$PWD/fifa-build-profile" \
+            --allow-other-metal \
+            $EXTRA_ARGS \
+            -o ../out_ipa/FIFA22_miao.ipa
 
           python3 - <<'PY'
           import plistlib, zipfile, shutil
