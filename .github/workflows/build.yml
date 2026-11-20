@@ -18,10 +18,18 @@ jobs:
     env:
       DOTNET_ROLL_FORWARD: Major
     steps:
-      - name: Cài .NET 10 SDK
+      - name: Cài .NET 10 SDK (arm64)
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
+
+      - name: Cài thêm .NET 10 Runtime (x64) cho dmsh_xlate
+        run: |
+          curl -sSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+          chmod +x /tmp/dotnet-install.sh
+          /tmp/dotnet-install.sh --channel 10.0 --runtime dotnet --architecture x64 --install-dir "$HOME/.dotnet-x64"
+          echo "DOTNET_ROOT_ARM64=$DOTNET_ROOT" >> "$GITHUB_ENV"
+          echo "DOTNET_ROOT_X64=$HOME/.dotnet-x64" >> "$GITHUB_ENV"
 
       - name: Cài công cụ build
         run: |
