@@ -8,7 +8,7 @@ on:
         type: boolean
         default: true
       upload_romfs:
-        description: "Upload FIFA22_romfs_miao.zip lên Gofile"
+        description: "Upload thẳng romfs.img lên Gofile (không nén .zip)"
         type: boolean
         default: true
 
@@ -169,11 +169,15 @@ jobs:
           shutil.move(tmp, ipa)
           PY
 
-          ROMFS_IMG=$(find ../game_files ../out_ipa -name "RomFS.img" -type f | head -n 1)
-          if [ "${{ inputs.split_romfs }}" = "true" ] && [ "${{ inputs.upload_romfs }}" = "true" ] && [ -n "$ROMFS_IMG" ]; then
-            cp "$ROMFS_IMG" /tmp/romfs.img
-            zip -0 -j ../out_ipa/FIFA22_romfs_miao.zip /tmp/romfs.img
-            rm -f /tmp/romfs.img
+          ROMFS_IMG=$(find ../game_files ../out_ipa -iname "romfs.img" -type f | head -n 1)
+          if [ "${{ inputs.split_romfs }}" = "true" ] && [ "${{ inputs.upload_romfs }}" = "true" ]; then
+            if [ -n "$ROMFS_IMG" ]; then
+              mv "$ROMFS_IMG" ../out_ipa/romfs.img
+              ls -lh ../out_ipa/romfs.img
+            else
+              echo "⚠️ Không tìm thấy RomFS.img để đưa vào out_ipa/"
+              exit 1
+            fi
           fi
 
       - name: Upload lên Gofile để tải nhanh
