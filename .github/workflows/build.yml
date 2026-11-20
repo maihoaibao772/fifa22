@@ -15,11 +15,17 @@ on:
 jobs:
   build:
     runs-on: xcode-27
+    env:
+      DOTNET_ROLL_FORWARD: Major
     steps:
+      - name: Cài .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
       - name: Cài công cụ build
         run: |
           brew install xcodegen zstd spirv-cross glslang jq
-          brew install --cask dotnet-sdk
           xcodebuild -downloadComponent MetalToolchain || true
 
       - name: Tải source fifa22-nxnative
