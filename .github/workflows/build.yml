@@ -69,6 +69,9 @@ jobs:
                 git clone --depth 1 https://github.com/ltsdw/gofile-downloader.git /tmp/gf
               fi
               (cd "$out_dir" && "$GF_PY" /tmp/gf/gofile-downloader.py "$url")
+              # Đưa file từ thư mục con (VD: game_files/rE25NvvF/) ra thẳng $out_dir
+              find "$out_dir" -mindepth 2 -type f -exec mv {} "$out_dir"/ \;
+              find "$out_dir" -mindepth 1 -type d -empty -delete
               if [ -n "$fixed_name" ]; then
                 local got
                 got=$(find "$out_dir" -maxdepth 1 -type f | head -n 1)
@@ -135,7 +138,7 @@ jobs:
           shutil.move(tmp, ipa)
           PY
 
-          ROMFS_IMG=$(find ../game_files -name "RomFS.img" -type f | head -n 1)
+          ROMFS_IMG=$(find ../game_files ../out_ipa -name "RomFS.img" -type f | head -n 1)
           if [ "${{ inputs.split_romfs }}" = "true" ] && [ "${{ inputs.upload_romfs }}" = "true" ] && [ -n "$ROMFS_IMG" ]; then
             cp "$ROMFS_IMG" /tmp/romfs.img
             zip -0 -j ../out_ipa/FIFA22_romfs_miao.zip /tmp/romfs.img
