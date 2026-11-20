@@ -48,13 +48,25 @@ jobs:
           fi
           find src -type f -name "*.sh" -exec chmod +x {} +
 
-      - name: Kiểm tra nhanh tool & profile trước khi tải game (tiết kiệm thời gian)
+      - name: Cài thư viện Python & công cụ tải
         working-directory: src
         run: |
+          python3 -m venv .venv
+          source .venv/bin/activate
+          if [ -f .github/requirements/tools.txt ]; then
+            python3 -m pip install -r .github/requirements/tools.txt
+          fi
+          python3 -m pip install gdown requests lz4 "capstone>=5,<6" fonttools nsz zbic pycryptodome zstandard pillow "backports.zstd; python_version < '3.14'"
+
+      - name: Kiểm tra nhanh toàn bộ tool, Python & profile trước khi tải game
+        working-directory: src
+        run: |
+          source .venv/bin/activate
           ./dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate --source-sha
           if [ -f ./dm/gfx/tools/spirv_cross_bin/spirv-cross ]; then
             ./dm/gfx/tools/spirv_cross_bin/spirv-cross --version || true
           fi
+          python3 -c "import lz4, capstone, fontTools, zbic, Crypto, Crypto.Cipher.AES, zstandard, PIL; print('[OK] Đủ toàn bộ thư viện Python')"
           ls -la "$PWD/fifa-build-profile"
 
       - name: Thêm credit Port by Miaomiaocutene lên Launcher
@@ -72,16 +84,6 @@ jobs:
           else:
               print("[WARN] Không tìm thấy anchor hoặc đã có sẵn credit")
           PY
-
-      - name: Cài thư viện Python & công cụ tải
-        working-directory: src
-        run: |
-          python3 -m venv .venv
-          source .venv/bin/activate
-          if [ -f .github/requirements/tools.txt ]; then
-            python3 -m pip install -r .github/requirements/tools.txt
-          fi
-          python3 -m pip install gdown requests lz4 "capstone>=5,<6" fonttools zbic "backports.zstd; python_version < '3.14'"
 
       - name: Tải Game & prod.keys (Gofile / Drive / Pixeldrain)
         env:
