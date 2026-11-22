@@ -1,212 +1,668 @@
-name: Build FIFA 22 Miao (A16)
+name: MiaoBuildCL Universal iOS Port Builder
 
 on:
   workflow_dispatch:
     inputs:
-      split_romfs:
-        description: "Tách riêng RomFS.img (bắt buộc cho FIFA 22 vì >13GB)"
+      chip_preset:
+        description: "Preset chip (under_a17 = Smart A16 ASTC, a17_plus = build gốc)"
+        type: choice
+        options:
+          - under_a17
+          - a17_plus
+        default: under_a17
+      packaging_mode:
+        description: "Chế độ đóng gói (separate_both / bundle / separate_ipa_only)"
+        type: choice
+        options:
+          - separate_both
+          - bundle
+          - separate_ipa_only
+        default: separate_both
+      engine_repo:
+        description: "URL repo engine"
+        required: false
+        default: "https://github.com/zenvyzenshiro/NXNativeWindows.git"
+      ipa_name:
+        description: "Tên file IPA đầu ra"
+        required: false
+        default: "GamePort_miao.ipa"
+      credit_text:
+        description: "Credit hiển thị kèm icon mèo"
+        required: false
+        default: "Port by Miaomiaocutene"
+      title_id:
+        description: "Title ID (tùy chọn cho patch 60 FPS)"
+        required: false
+        default: ""
+      use_update:
+        description: "Tải thêm Update từ secret UPDATE_URL"
+        type: boolean
+        default: false
+      use_vh:
+        description: "Chèn gói Việt hóa từ secret VH_URL"
+        type: boolean
+        default: false
+      enable_60fps:
+        description: "Mở khóa 60 FPS trong game.tsv"
         type: boolean
         default: true
-      upload_romfs:
-        description: "Upload thẳng romfs.img lên Gofile (không nén .zip)"
+      enable_ram_unlock:
+        description: "Mở khóa thêm RAM (Increased Memory Limit)"
         type: boolean
         default: true
+
+permissions:
+  contents: write
+  issues: write
 
 jobs:
   build:
     runs-on: xcode-27
+    timeout-minutes: 120
     env:
-      DOTNET_ROLL_FORWARD: Major
+      GH_TOKEN: ${{ github.token }}
+
     steps:
-      - name: Cài .NET 10 SDK (arm64)
+      - name: Setup MiaoBuildCL Live Progress Telemetry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat <<'PY' > /tmp/miao_live.py
+          import json, os, sys, time, urllib.request
+
+          REPO = os.environ.get("GITHUB_REPOSITORY", "")
+          RUN_ID = int(os.environ.get("GITHUB_RUN_ID", "0") or 0)
+          TOKEN = os.environ.get("GH_TOKEN", "")
+          STATE_FILE = "/tmp/miao_live_issue.txt"
+
+          def gh_req(method, path, payload=None):
+              if not TOKEN or not REPO:
+                  return None
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{REPO}{path}",
+                  data=(json.dumps(payload).encode() if payload is not None else None),
+                  method=method,
+                  headers={
+                      "Authorization": f"Bearer {TOKEN}",
+                      "Accept": "application/vnd.github+json",
+                      "Content-Type": "application/json",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=8) as r:
+                      return json.loads(r.read().decode("utf-8", "ignore"))
+              except Exception:
+                  return None
+
+          def get_issue_number():
+              if os.path.exists(STATE_FILE):
+                  v = open(STATE_FILE).read().strip()
+                  if v.isdigit():
+                      return int(v)
+              items = gh_req("GET", "/issues?state=all&per_page=30") or []
+              for it in items:
+                  if it.get("title") == "[MiaoBuildCL-Live]":
+                      num = it["number"]
+                      open(STATE_FILE, "w").write(str(num))
+                      return num
+              created = gh_req("POST", "/issues", {"title": "[MiaoBuildCL-Live]", "body": "{}"})
+              if created and "number" in created:
+                  num = created["number"]
+                  open(STATE_FILE, "w").write(str(num))
+                  return num
+              return None
+
+          def push(stage, title, pct, speed="", transferred="", detail="", tail=None, close=False):
+              num = get_issue_number()
+              if not num:
+                  return
+              body = json.dumps({
+                  "run_id": RUN_ID,
+                  "stage": stage,
+                  "step_title": title,
+                  "percent": max(0, min(100, int(pct))),
+                  "speed": speed,
+                  "transferred": transferred,
+                  "detail": detail,
+                  "tail": (tail or [])[-12:],
+                  "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              }, ensure_ascii=False)
+              payload = {"body": body, "state": ("closed" if close else "open")}
+              gh_req("PATCH", f"/issues/{num}", payload)
+
+          if __name__ == "__main__":
+              args = sys.argv[1:]
+              if len(args) >= 3:
+                  stage, title, pct = args[0], args[1], int(args[2])
+                  speed = args[3] if len(args) > 3 else ""
+                  transferred = args[4] if len(args) > 4 else ""
+                  detail = args[5] if len(args) > 5 else ""
+                  close = (stage == "done")
+                  push(stage, title, pct, speed, transferred, detail, [], close=close)
+          PY
+          python3 /tmp/miao_live.py "init" "Khởi tạo máy ảo macOS" 5 "" "" "Đang chuẩn bị môi trường build..." || true
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Free Up macOS Runner Disk Space
+        run: |
+          python3 /tmp/miao_live.py "disk" "Dọn ổ đĩa máy ảo macOS" 12 "" "" "Đang giải phóng tối đa dung lượng trống..." || true
+          echo "=== Disk space before cleanup ==="
+          df -h /
+
+          # 1. Xóa các bản Xcode phụ không dùng (giữ nguyên bản Xcode đang active)
+          ACTIVE_XCODE="$(xcode-select -p 2>/dev/null | sed -E 's|^(/Applications/[^/]+\.app).*|\1|' || true)"
+          echo "Active Xcode: ${ACTIVE_XCODE:-unknown}"
+          for app in /Applications/Xcode*.app; do
+            if [ -d "$app" ] && [ "$app" != "$ACTIVE_XCODE" ]; then
+              echo "Removing unused Xcode: $app"
+              sudo rm -rf "$app" 2>/dev/null || true
+            fi
+          done
+
+          # 2. Xóa Simulator runtimes (build IPA thật cho iPhone không cần Simulator)
+          xcrun simctl delete unavailable 2>/dev/null || true
+          xcrun simctl runtime delete all 2>/dev/null || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Volumes/* /Library/Developer/CoreSimulator/Images/* 2>/dev/null || true
+
+          # 3. Xóa SDK & cache nặng không dùng (Android, Java, Rust, Gradle, npm, Caches)
+          sudo rm -rf /Users/runner/Library/Android /usr/local/lib/android /Library/Java/JavaVirtualMachines 2>/dev/null || true
+          sudo rm -rf /Users/runner/.rustup /Users/runner/.cargo /Users/runner/.gradle /Users/runner/.m2 /Users/runner/.npm 2>/dev/null || true
+          rm -rf ~/Library/Caches/* ~/Library/Developer/Xcode/DerivedData /tmp/*.dmg 2>/dev/null || true
+
+          echo "=== Disk space after cleanup ==="
+          df -h /
+
+      - name: Install Homebrew dependencies & Metal Toolchain
+        run: |
+          python3 /tmp/miao_live.py "brew" "Cài Homebrew & Metal Toolchain" 22 "" "" "Đang cài đặt công cụ biên dịch..." || true
+          set -euo pipefail
+          brew install xcodegen zstd spirv-cross glslang jq p7zip
+          brew cleanup --prune=all || true
+          xcodebuild -downloadComponent MetalToolchain || true
+
+      - name: Setup .NET 10 SDK (arm64)
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
 
-      - name: Cài thêm .NET 10 Runtime (x64) cho dmsh_xlate
+      - name: Setup .NET 10 Runtime (x64 for Rosetta tools)
         run: |
-          curl -sSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
-          chmod +x /tmp/dotnet-install.sh
-          /tmp/dotnet-install.sh --channel 10.0 --runtime dotnet --architecture x64 --install-dir "$HOME/.dotnet-x64"
+          python3 /tmp/miao_live.py "dotnet" "Cài đặt .NET 10 Runtime" 30 "" "" "Đang thiết lập môi trường .NET..." || true
+          set -euo pipefail
+          curl -sSL https://dot.net/v1/dotnet-install.sh -o dotnet-install.sh
+          chmod +x dotnet-install.sh
+          ./dotnet-install.sh --channel 10.0 --runtime dotnet --architecture x64 --install-dir "$HOME/.dotnet-x64"
+          rm -f dotnet-install.sh
           echo "DOTNET_ROOT_ARM64=$DOTNET_ROOT" >> "$GITHUB_ENV"
           echo "DOTNET_ROOT_X64=$HOME/.dotnet-x64" >> "$GITHUB_ENV"
+          echo "DOTNET_ROLL_FORWARD=Major" >> "$GITHUB_ENV"
 
-      - name: Cài công cụ build
+      - name: Clone Engine & Smart A16 Auto-Patch + Options + Miao Credit
+        env:
+          CHIP_PRESET: ${{ inputs.chip_preset }}
+          ENGINE_REPO: ${{ inputs.engine_repo }}
+          TITLE_ID: ${{ inputs.title_id }}
+          ENABLE_60FPS: ${{ inputs.enable_60fps }}
+          ENABLE_RAM: ${{ inputs.enable_ram_unlock }}
+          CREDIT_TEXT: ${{ inputs.credit_text }}
         run: |
-          brew install xcodegen zstd spirv-cross glslang jq
-          xcodebuild -downloadComponent MetalToolchain || true
+          set -euo pipefail
+          python3 /tmp/miao_live.py "engine" "Kéo Engine Port & Vá A16" 40 "" "" "Đang tải mã nguồn engine..." || true
+          git clone --depth 1 "$ENGINE_REPO" src
+          if [ -f "src/tools/engine.py" ] && [ ! -f "src/scripts/build_ipa_from_nsp.py" ]; then
+            echo "[NX2Apple] Phát hiện cấu trúc wrapper -> chạy tools/engine.py sync..."
+            (cd src && python3 tools/engine.py sync)
+            mv src src_wrapper
+            mv src_wrapper/engine src
+            rm -rf src_wrapper
+          fi
 
-      - name: Tải source fifa22-nxnative & cấp quyền thực thi
-        run: |
-          git clone --depth 1 https://github.com/Jeb0978/fifa22-nxnative.git src
-          chmod +x src/dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate
-          if [ -f src/dm/gfx/tools/spirv_cross_bin/spirv-cross ]; then
-            chmod +x src/dm/gfx/tools/spirv_cross_bin/spirv-cross
+          # 1. Smart A16 Auto-Patch (tự phát hiện engine đã có BC mềm hay cần ghép từ NXNativeWindows / patch_a16.py)
+          if [ "$CHIP_PRESET" = "under_a17" ]; then
+            if [ -f "src/dm/gfx/tex/bc_soft.c" ] || [ -f "src/dm/gfx/tex/nvn_bcdec.c" ]; then
+              echo "[A16 SMART] Engine đã tích hợp sẵn giải mã BC mềm cho A16."
+            else
+              echo "[A16 SMART] Engine gốc (upstream) chưa có giải mã BC mềm -> tiến hành ghép thông minh..."
+              CUSTOM_PATCH="$(find . -maxdepth 3 -name "patch_a16*.py" -not -path "./src/*" | head -n 1)"
+              if [ -n "$CUSTOM_PATCH" ]; then
+                git clone --depth 1 https://github.com/Jeb0978/fifa22-nxnative.git tmp_a16
+                cp -v tmp_a16/dm/gfx/tex/*bcdec* src/dm/gfx/tex/ || true
+                rm -rf tmp_a16
+                python3 "$CUSTOM_PATCH" src
+              else
+                echo "[A16 SMART] Kéo bộ giải mã ASTC (bc_soft) từ NXNativeWindows..."
+                git clone --depth 1 https://github.com/zenvyzenshiro/NXNativeWindows.git tmp_nxw
+                cp -v tmp_nxw/dm/gfx/tex/bc_soft.* src/dm/gfx/tex/ || true
+                python3 - <<'PY'
+          import os, re, shutil
+          # Kiểm tra & tự động đăng ký bc_soft.c vào build_ipa.sh / Makefile nếu chưa có
+          for rel in ("src/dm/host/Makefile", "src/dm/ios/tools/build_ipa.sh"):
+              if os.path.isfile(rel):
+                  txt = open(rel, encoding="utf-8").read()
+                  if "bc_soft.c" not in txt and "tex_layout.c" in txt:
+                      txt = txt.replace("tex_layout.c", "tex_layout.c bc_soft.c", 1)
+                      open(rel, "w", encoding="utf-8").write(txt)
+                      print(f"[A16 SMART] Registered bc_soft.c in {rel}")
+          # Báo trạng thái hook nvn_mtl.m
+          mtl = "src/dm/gfx/nvn/nvn_mtl.m"
+          if os.path.isfile(mtl):
+              mtxt = open(mtl, encoding="utf-8").read()
+              if "bc_soft" not in mtxt:
+                  print("[A16 SMART WARN] Upstream nvn_mtl.m chưa có hook bc_soft; khuyến nghị thêm patch_a16.py hoặc dùng NXNativeWindows cho game nặng.")
+          PY
+                rm -rf tmp_nxw
+              fi
+            fi
+          else
+            echo "[INFO] Preset A17 Pro trở lên -> build nguyên bản (BC phần cứng)"
           fi
-          if [ -f src/dm/tools/nx_extract_bin/nx_extract ]; then
-            chmod +x src/dm/tools/nx_extract_bin/nx_extract
+
+          # 2. Vá lỗi linker _nxw_show_data_help khi build fork NXNativeWindows trên macOS/Xcode
+          if [ -f "src/dm/host/front_ios.m" ]; then
+            python3 - <<'PY'
+          path = "src/dm/host/front_ios.m"
+          code = open(path, encoding="utf-8").read()
+          if "nxw_show_data_help" in code and "miao_weak_nxw_show_data_help" not in code:
+              open(path, "w", encoding="utf-8").write(code + "\n/* miao_weak_nxw_show_data_help */\n__attribute__((weak)) void nxw_show_data_help(void) {}\n")
+              print("[PATCH] Added weak stub for nxw_show_data_help")
+          PY
           fi
+
+          # 3. Mở khóa 60 FPS nếu game có profile sẵn
+          if [ "$ENABLE_60FPS" = "true" ] && [ -n "$TITLE_ID" ] && [ -f "src/dm/games/$TITLE_ID/game.tsv" ]; then
+            python3 - <<'PY'
+          import os
+          tsv = f"src/dm/games/{os.environ['TITLE_ID']}/game.tsv"
+          lines = open(tsv, encoding="utf-8").read().splitlines()
+          overrides = {"present_interval": "display", "fps_target": "60"}
+          seen, out = set(), []
+          for ln in lines:
+              s = ln.strip()
+              if s and not s.startswith("#") and s.split()[0] in overrides:
+                  k = s.split()[0]
+                  out.append(f"{k}\t{overrides[k]}")
+                  seen.add(k)
+              else:
+                  out.append(ln)
+          for k, v in overrides.items():
+              if k not in seen:
+                  out.append(f"{k}\t{v}")
+          open(tsv, "w", encoding="utf-8").write("\n".join(out) + "\n")
+          PY
+          fi
+
+          # 4. Entitlements mở khóa RAM
+          if [ "$ENABLE_RAM" = "true" ]; then
+            cat > entitlements.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.developer.kernel.increased-memory-limit</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+            plutil -lint entitlements.plist
+          fi
+
+          # 5. Nhúng Credit + icon đầu mèo SwiftUI vào Launcher.swift
+          if [ -f "src/dm/ios/Sources/Launcher.swift" ]; then
+            python3 - <<'PY'
+          import os, re
+          launcher = "src/dm/ios/Sources/Launcher.swift"
+          credit = os.environ.get("CREDIT_TEXT", "Port by Miaomiaocutene").replace('"', '\\"')
+          code = open(launcher, encoding="utf-8").read()
+          if "MiaoCreditBadge" not in code:
+              m = re.search(r'(var\s+body\s*:\s*some\s+View\s*\{)', code)
+              if m:
+                  hook = "var body: some View { miaoWrapView(miaoOriginalBody) }\n    @ViewBuilder private var miaoOriginalBody: some View {"
+                  code = code[:m.start()] + hook + code[m.end():]
+                  code += f'''
+          private struct MiaoCatHeadShape: Shape {{
+              func path(in rect: CGRect) -> Path {{
+                  let w = rect.width, h = rect.height
+                  var p = Path()
+                  p.move(to: CGPoint(x: w * 0.16, y: h * 0.44))
+                  p.addLine(to: CGPoint(x: w * 0.22, y: h * 0.10))
+                  p.addLine(to: CGPoint(x: w * 0.40, y: h * 0.28))
+                  p.addQuadCurve(to: CGPoint(x: w * 0.60, y: h * 0.28), control: CGPoint(x: w * 0.50, y: h * 0.24))
+                  p.addLine(to: CGPoint(x: w * 0.78, y: h * 0.10))
+                  p.addLine(to: CGPoint(x: w * 0.84, y: h * 0.44))
+                  p.addCurve(to: CGPoint(x: w * 0.50, y: h * 0.90), control1: CGPoint(x: w * 0.90, y: h * 0.72), control2: CGPoint(x: w * 0.72, y: h * 0.90))
+                  p.addCurve(to: CGPoint(x: w * 0.16, y: h * 0.44), control1: CGPoint(x: w * 0.28, y: h * 0.90), control2: CGPoint(x: w * 0.10, y: h * 0.72))
+                  p.closeSubpath()
+                  return p
+              }}
+          }}
+          private struct MiaoCatIconView: View {{
+              var body: some View {{
+                  ZStack {{
+                      MiaoCatHeadShape().fill(Color.pink.opacity(0.92))
+                      MiaoCatHeadShape().stroke(Color.white.opacity(0.9), lineWidth: 1.2)
+                      HStack(spacing: 4) {{
+                          Circle().fill(Color.black).frame(width: 2.6, height: 2.6)
+                          Circle().fill(Color.black).frame(width: 2.6, height: 2.6)
+                      }}.offset(y: 0.5)
+                      Circle().fill(Color.white).frame(width: 2.2, height: 2.2).offset(y: 3.5)
+                  }}.frame(width: 18, height: 18)
+              }}
+          }}
+          private struct MiaoCreditBadge: View {{
+              var body: some View {{
+                  HStack(spacing: 6) {{
+                      MiaoCatIconView()
+                      Text("{credit}").font(.caption2.weight(.semibold)).foregroundColor(.white)
+                  }}
+                  .padding(.horizontal, 10).padding(.vertical, 5)
+                  .background(Color.black.opacity(0.55)).clipShape(Capsule())
+                  .overlay(Capsule().stroke(Color.pink.opacity(0.65), lineWidth: 1))
+                  .allowsHitTesting(false)
+              }}
+          }}
+          private func miaoWrapView<V: View>(_ content: V) -> some View {{
+              ZStack(alignment: .bottomTrailing) {{ content; MiaoCreditBadge().padding(.trailing, 12).padding(.bottom, 10) }}
+          }}
+          '''
+                  open(launcher, "w", encoding="utf-8").write(code)
+          PY
+          fi
+
+          chmod +x src/dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate 2>/dev/null || true
+          chmod +x src/dm/gfx/tools/spirv_cross_bin/spirv-cross 2>/dev/null || true
+          chmod +x src/dm/tools/nx_extract_bin/nx_extract 2>/dev/null || true
           find src -type f -name "*.sh" -exec chmod +x {} +
 
-      - name: Cài thư viện Python & công cụ tải
-        working-directory: src
+      - name: Setup Python venv & Pre-Flight Check
+        env:
+          GAME_URL: ${{ secrets.GAME_URL }}
+          KEYS_URL: ${{ secrets.KEYS_URL }}
+          UPDATE_URL: ${{ secrets.UPDATE_URL }}
+          VH_URL: ${{ secrets.VH_URL }}
+          USE_UPDATE: ${{ inputs.use_update }}
+          USE_VH: ${{ inputs.use_vh }}
         run: |
+          set -euo pipefail
+          python3 /tmp/miao_live.py "python" "Cài thư viện Python & Kiểm tra Secrets" 50 "" "" "Đang cài gói Python cần thiết..." || true
           python3 -m venv .venv
           source .venv/bin/activate
-          if [ -f .github/requirements/tools.txt ]; then
-            python3 -m pip install -r .github/requirements/tools.txt
-          fi
-          python3 -m pip install gdown requests lz4 "capstone>=5,<6" fonttools nsz zbic pycryptodome zstandard pillow "backports.zstd; python_version < '3.14'"
+          pip install --no-cache-dir --upgrade pip
+          if [ -f src/.github/requirements/tools.txt ]; then pip install --no-cache-dir -r src/.github/requirements/tools.txt; fi
+          pip install --no-cache-dir gdown requests lz4 "capstone>=5,<6" fonttools nsz zbic pycryptodome zstandard pillow "backports.zstd; python_version < '3.14'"
+          test -n "$GAME_URL"
+          test -n "$KEYS_URL"
+          if [ "$USE_UPDATE" = "true" ]; then test -n "$UPDATE_URL"; fi
+          if [ "$USE_VH" = "true" ]; then test -n "$VH_URL"; fi
 
-      - name: Kiểm tra nhanh toàn bộ tool, Python & profile trước khi tải game
-        working-directory: src
-        run: |
-          source .venv/bin/activate
-          ./dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate --source-sha
-          if [ -f ./dm/gfx/tools/spirv_cross_bin/spirv-cross ]; then
-            ./dm/gfx/tools/spirv_cross_bin/spirv-cross --version || true
-          fi
-          python3 -c "import lz4, capstone, fontTools, zbic, Crypto, Crypto.Cipher.AES, zstandard, PIL; print('[OK] Đủ toàn bộ thư viện Python')"
-          ls -la "$PWD/fifa-build-profile"
-
-      - name: Thêm credit Port by Miaomiaocutene lên Launcher
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path("src/dm/ios/Sources/Launcher.swift")
-          txt = p.read_text(encoding="utf-8")
-          anchor = 'if #available(iOS 26.0, *) { button.buttonStyle(.glassProminent) } else { button.buttonStyle(.borderedProminent) }'
-          credit = '        Text("Port by Miaomiaocutene").font(.caption).foregroundStyle(.secondary)'
-          if anchor in txt and "Port by Miaomiaocutene" not in txt:
-              txt = txt.replace(anchor, anchor + "\n" + credit, 1)
-              p.write_text(txt, encoding="utf-8")
-              print("[OK] Đã thêm credit vào Launcher.swift")
-          else:
-              print("[WARN] Không tìm thấy anchor hoặc đã có sẵn credit")
-          PY
-
-      - name: Tải Game & prod.keys (Gofile / Drive / Pixeldrain)
+      - name: Download Game, Update, Keys & VH
         env:
-          GAME_URL: ${{ secrets.Game_URL }}
-          KEYS_URL: ${{ secrets.Keys_URL }}
-          UPDATE_URL: ${{ secrets.Update_URL }}
+          GAME_URL: ${{ secrets.GAME_URL }}
+          UPDATE_URL: ${{ secrets.UPDATE_URL }}
+          KEYS_URL: ${{ secrets.KEYS_URL }}
+          VH_URL: ${{ secrets.VH_URL }}
+          USE_UPDATE: ${{ inputs.use_update }}
+          USE_VH: ${{ inputs.use_vh }}
         run: |
-          mkdir -p game_files keys out_ipa
-          GDOWN="$PWD/src/.venv/bin/gdown"
-          GF_PY="$PWD/src/.venv/bin/python"
+          set -euo pipefail
+          source .venv/bin/activate
+          python3 /tmp/miao_live.py "download" "Tải Game, Keys & Việt hóa" 60 "" "" "Đang tải dữ liệu game từ Secrets..." || true
+          mkdir -p game_files keys_dir vh_raw out_ipa
+          curl -sSL https://raw.githubusercontent.com/ltsdw/gofile-downloader/main/gofile-downloader.py -o gofile-downloader.py
 
-          download_file() {
+          download_any() {
             local url="$1"
             local out_dir="$2"
-            local fixed_name="$3"
-
-            if [[ "$url" == *"gofile.io/"* ]]; then
-              if [ ! -f /tmp/gf/gofile-downloader.py ]; then
-                git clone --depth 1 https://github.com/ltsdw/gofile-downloader.git /tmp/gf
-              fi
-              (cd "$out_dir" && "$GF_PY" /tmp/gf/gofile-downloader.py "$url")
-              # Đưa file từ thư mục con (VD: game_files/rE25NvvF/) ra thẳng $out_dir
-              find "$out_dir" -mindepth 2 -type f -exec mv {} "$out_dir"/ \;
-              find "$out_dir" -mindepth 1 -type d -empty -delete
-              if [ -n "$fixed_name" ]; then
-                local got
-                got=$(find "$out_dir" -maxdepth 1 -type f | head -n 1)
-                if [ -n "$got" ] && [ "$(basename "$got")" != "$fixed_name" ]; then
-                  mv "$got" "${out_dir}/${fixed_name}"
-                fi
-              fi
-            elif [[ "$url" == *"pixeldrain.com/u/"* ]]; then
-              local pid
-              pid=$(echo "$url" | sed -E 's|.*pixeldrain\.com/u/([^/?#]+).*|\1|')
-              if [ -n "$fixed_name" ]; then
-                curl -fL "https://pixeldrain.com/api/file/${pid}?download" -o "${out_dir}/${fixed_name}"
+            local flatten="${3:-true}"
+            if [[ "$url" == *"gofile.io"* ]]; then
+              GF_DOWNLOAD_DIR="$out_dir" python3 gofile-downloader.py "$url"
+            elif [[ "$url" == *"drive.google.com"* ]]; then
+              if [[ "$url" == *"/folders/"* ]]; then
+                (cd "$out_dir" && gdown --folder "$url")
               else
-                (cd "$out_dir" && curl -fL -J -O "https://pixeldrain.com/api/file/${pid}?download")
-              fi
-            elif [[ "$url" == *"drive.google.com"* ]] || [[ "$url" == *"docs.google.com"* ]]; then
-              if [ -n "$fixed_name" ]; then
-                "$GDOWN" "$url" -O "${out_dir}/${fixed_name}"
-              else
-                (cd "$out_dir" && "$GDOWN" "$url")
+                local fid
+                fid="$(echo "$url" | sed -nE 's/.*\/d\/([^\/?]+).*/\1/p; s/.*[?&]id=([^&]+).*/\1/p' | head -n 1)"
+                if [ -n "$fid" ]; then (cd "$out_dir" && gdown "https://drive.google.com/uc?id=${fid}"); else (cd "$out_dir" && gdown "$url"); fi
               fi
             else
-              if [ -n "$fixed_name" ]; then
-                curl -fL "$url" -o "${out_dir}/${fixed_name}"
-              else
-                (cd "$out_dir" && curl -fL -J -O "$url")
-              fi
+              (cd "$out_dir" && curl -fSL -O -J "$url")
+            fi
+            if [ "$flatten" = "true" ]; then
+              find "$out_dir" -mindepth 2 -type f -exec mv -f {} "$out_dir"/ \;
+              find "$out_dir" -mindepth 1 -type d -empty -delete
             fi
           }
 
-          download_file "$KEYS_URL" "keys" "prod.keys"
-          download_file "$GAME_URL" "game_files" ""
-          if [ -n "$UPDATE_URL" ]; then
-            download_file "$UPDATE_URL" "game_files" ""
-          fi
-          ls -lh keys game_files
+          download_any "$KEYS_URL" "keys_dir" "true"
+          download_any "$GAME_URL" "game_files" "true"
+          if [ "$USE_UPDATE" = "true" ] && [ -n "$UPDATE_URL" ]; then download_any "$UPDATE_URL" "game_files" "true"; fi
 
-      - name: Build FIFA22_miao.ipa
-        working-directory: src
-        run: |
-          source .venv/bin/activate
-          EXTRA_ARGS=""
-          if [ "${{ inputs.split_romfs }}" = "true" ]; then
-            EXTRA_ARGS="--romfs separate"
-          fi
-
-          python3 scripts/build_ipa_from_nsp.py ../game_files \
-            -k ../keys/prod.keys \
-            --profile-out "$PWD/fifa-build-profile" \
-            --allow-other-metal \
-            $EXTRA_ARGS \
-            -o ../out_ipa/FIFA22_miao.ipa
-
-          python3 - <<'PY'
-          import plistlib, zipfile, shutil
-          from pathlib import Path
-          ipa = Path("../out_ipa/FIFA22_miao.ipa")
-          tmp = Path("../out_ipa/FIFA22_miao_tmp.ipa")
-          with zipfile.ZipFile(ipa, "r") as zn:
-              plist_path = next(p for p in zn.namelist() if p.endswith(".app/Info.plist"))
-              plist = plistlib.loads(zn.read(plist_path))
-              plist["NSHumanReadableCopyright"] = "Port by Miaomiaocutene"
-              with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zo:
-                  for item in zn.infolist():
-                      if item.filename == plist_path:
-                          zo.writestr(item, plistlib.dumps(plist, fmt=plistlib.FMT_BINARY))
-                      else:
-                          zo.writestr(item, zn.read(item.filename))
-          shutil.move(tmp, ipa)
-          PY
-
-          ROMFS_IMG=$(find ../game_files ../out_ipa -iname "romfs.img" -type f | head -n 1)
-          if [ "${{ inputs.split_romfs }}" = "true" ] && [ "${{ inputs.upload_romfs }}" = "true" ]; then
-            if [ -n "$ROMFS_IMG" ]; then
-              mv "$ROMFS_IMG" ../out_ipa/romfs.img
-              ls -lh ../out_ipa/romfs.img
-            else
-              echo "⚠️ Không tìm thấy RomFS.img để đưa vào out_ipa/"
+          if [ "$USE_VH" = "true" ] && [ -n "$VH_URL" ]; then
+            download_any "$VH_URL" "vh_raw" "false"
+            mkdir -p vh_raw/unpacked
+            while IFS= read -r -d '' arc; do
+              7z x -y "$arc" -ovh_raw/unpacked >/dev/null
+              rm -f "$arc"
+            done < <(find vh_raw -maxdepth 3 -type f \( -iname "*.zip" -o -iname "*.rar" -o -iname "*.7z" \) -print0)
+            VH_COUNT="$(find vh_raw -type f ! -name "._*" ! -name ".DS_Store" ! -iname "*.zip" ! -iname "*.rar" ! -iname "*.7z" | wc -l | tr -d ' ')"
+            echo "[VH PRE-CHECK] Found $VH_COUNT unpacked localization file(s)."
+            if [ "$VH_COUNT" -eq 0 ]; then
+              echo "::error::USE_VH=true nhưng không tìm thấy file Việt hóa hợp lệ nào trong vh_raw!"
               exit 1
             fi
           fi
+          df -h /
 
-      - name: Upload lên Gofile để tải nhanh
+      - name: Build IPA (Universal VH + 60FPS + Gofile)
+        env:
+          IPA_NAME: ${{ inputs.ipa_name }}
+          CREDIT_TEXT: ${{ inputs.credit_text }}
+          PACK_MODE: ${{ inputs.packaging_mode }}
+          USE_VH: ${{ inputs.use_vh }}
+          ENABLE_60FPS: ${{ inputs.enable_60fps }}
+          ENABLE_RAM: ${{ inputs.enable_ram_unlock }}
         run: |
-          SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')
-          echo "### Link tải FIFA 22 - Port by Miaomiaocutene" >> "$GITHUB_STEP_SUMMARY"
-          for f in out_ipa/*; do
-            if [ -f "$f" ]; then
-              RES=$(curl -s -F "file=@$f" "https://${SERVER}.gofile.io/contents/uploadfile")
-              LINK=$(echo "$RES" | jq -r '.data.downloadPage')
-              NAME=$(basename "$f")
-              echo ">>> $NAME: $LINK"
-              echo "- **$NAME**: $LINK" >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          source .venv/bin/activate
+          export ROOT="$PWD"
+          PROD_KEYS="$(find "$ROOT/keys_dir" -type f -iname "*prod.keys*" | head -n 1)"
+          if [ -z "$PROD_KEYS" ]; then PROD_KEYS="$(find "$ROOT/keys_dir" -type f -iname "*.keys" | head -n 1)"; fi
+          test -n "$PROD_KEYS"
+          export PROD_KEYS
+
+          if [ -f "$ROOT/src/dm/gfx/tools/dmsh_chain.py" ]; then
+            (cd "$ROOT/src" && python3 dm/gfx/tools/dmsh_chain.py --update-lock) || true
+          fi
+
+          cat > "$ROOT/miao_env.txt" <<EOF
+          DM_ALIAS_SIZE=0x180000000
+          EOF
+          if [ "$ENABLE_60FPS" = "true" ]; then
+            cat >> "$ROOT/miao_env.txt" <<EOF
+          DM_PRESENT_INTERVAL=display
+          DM_FPS_TARGET=60
+          EOF
+          fi
+
+          ENT_ENV=""
+          if [ "$ENABLE_RAM" = "true" ] && [ -f "$ROOT/entitlements.plist" ]; then ENT_ENV="DM_ENTITLEMENTS=$ROOT/entitlements.plist"; fi
+          ROMFS_ARGS="--romfs separate"
+          if [ "$PACK_MODE" = "bundle" ]; then ROMFS_ARGS=""; fi
+
+          HELP_OUT="$(cd "$ROOT/src" && python3 scripts/build_ipa_from_nsp.py --help 2>&1 || true)"
+          NO_HEAP_ARG=""; echo "$HELP_OUT" | grep -q -- "--no-heap-check" && NO_HEAP_ARG="--no-heap-check"
+          KEEP_EXT_ARG=""; echo "$HELP_OUT" | grep -q -- "--keep-extracted" && KEEP_EXT_ARG="--keep-extracted"
+          ENV_FILE_ARG=""; echo "$HELP_OUT" | grep -q -- "--env-file" && ENV_FILE_ARG="--env-file $ROOT/miao_env.txt"
+
+          python3 /tmp/miao_live.py "build" "Biên dịch & Đóng gói IPA" 75 "" "" "Đang dịch shader & tạo file .ipa..." || true
+          run_nx_build() {
+            (cd "$ROOT/src" && env $ENT_ENV python3 scripts/build_ipa_from_nsp.py "$ROOT/game_files" \
+              -k "$PROD_KEYS" --allow-other-metal $NO_HEAP_ARG $KEEP_EXT_ARG $ENV_FILE_ARG $ROMFS_ARGS -o "$ROOT/out_ipa/$IPA_NAME")
+          }
+
+          run_nx_build
+          rm -f "$ROOT/.need_repack"
+
+          if [ "$ENABLE_60FPS" = "true" ]; then
+            python3 - <<'PY'
+          import os, glob
+          root = os.environ["ROOT"]
+          for tsv in glob.glob(os.path.join(root, "game_files", "*_build", "profile", "*", "game.tsv")):
+              lines = open(tsv, encoding="utf-8").read().splitlines()
+              overrides = {"present_interval": "display", "fps_target": "60"}
+              seen, out = set(), []
+              for ln in lines:
+                  s = ln.strip()
+                  if s and not s.startswith("#") and s.split()[0] in overrides:
+                      k = s.split()[0]; out.append(f"{k}\t{overrides[k]}"); seen.add(k)
+                  else:
+                      out.append(ln)
+              for k, v in overrides.items():
+                  if k not in seen: out.append(f"{k}\t{v}")
+              open(tsv, "w", encoding="utf-8").write("\n".join(out) + "\n")
+              open(os.path.join(root, ".need_repack"), "w").write("1")
+          PY
+          fi
+
+          if [ "$USE_VH" = "true" ]; then
+            python3 /tmp/miao_live.py "vh" "Chèn Việt hóa & Đóng gói RomFS" 88 "" "" "Đang chèn Việt hóa và dọn dung lượng đĩa..." || true
+            python3 - <<'PY'
+          import os, sys, glob, shutil, subprocess
+          root = os.environ["ROOT"]
+          prod_keys = os.environ["PROD_KEYS"]
+          vh_raw = os.path.join(root, "vh_raw")
+          nx_extract = os.path.join(root, "src", "dm", "tools", "nx_extract_bin", "nx_extract")
+          romfs_tool = os.path.join(root, "src", "dm", "tools", "romfs_image.py")
+          search_base = os.path.join(vh_raw, "unpacked") if os.path.isdir(os.path.join(vh_raw, "unpacked")) else vh_raw
+          vh_romfs_root = None
+          for dp, dns, _ in os.walk(search_base):
+              for d in dns:
+                  if d.lower() == "romfs":
+                      vh_romfs_root = os.path.join(dp, d); break
+              if vh_romfs_root: break
+          if not vh_romfs_root:
+              vh_romfs_root = search_base
+
+          def overlay_tree(src_root, dst_root):
+              ow, add = 0, 0
+              for dp, _, fns in os.walk(src_root):
+                  for fn in fns:
+                      if fn.startswith("._") or fn == ".DS_Store" or fn.lower().endswith((".zip", ".rar", ".7z")): continue
+                      sf = os.path.join(dp, fn)
+                      parts = os.path.relpath(sf, src_root).split(os.sep)
+                      cur = dst_root
+                      for part in parts[:-1]:
+                          m = next((e for e in os.listdir(cur) if e.lower() == part.lower() and os.path.isdir(os.path.join(cur, e))), None) if os.path.isdir(cur) else None
+                          cur = os.path.join(cur, m or part)
+                          os.makedirs(cur, exist_ok=True)
+                      tname = parts[-1]
+                      ex = False
+                      if os.path.isdir(cur):
+                          m = next((e for e in os.listdir(cur) if e.lower() == tname.lower() and os.path.isfile(os.path.join(cur, e))), None)
+                          if m: tname = m; ex = True
+                      shutil.copy2(sf, os.path.join(cur, tname))
+                      ow += 1 if ex else 0; add += 0 if ex else 1
+              return ow, add
+
+          vers = sorted(glob.glob(os.path.join(root, "game_files", "*_build", "extract", "v*")))
+          if not vers:
+              print("[VH ERROR] No extract/v* directory found.", file=sys.stderr)
+              sys.exit(1)
+          ver_dir = vers[-1]
+          romfs_dir = next((os.path.join(ver_dir, e) for e in os.listdir(ver_dir) if e.lower() == "romfs" and os.path.isdir(os.path.join(ver_dir, e))), None)
+          romfs_img = next((os.path.join(ver_dir, e) for e in os.listdir(ver_dir) if e.lower() == "romfs.img" and os.path.isfile(os.path.join(ver_dir, e))), None)
+
+          if romfs_dir:
+              ow, add = overlay_tree(vh_romfs_root, romfs_dir)
+              print(f"[VH] Overlaid into romfs dir: {ow} overwritten, {add} added.")
+              if ow + add == 0:
+                  print("[VH ERROR] No files were overlaid into romfs dir.", file=sys.stderr)
+                  sys.exit(1)
+              shutil.rmtree(vh_raw, ignore_errors=True)
+          elif romfs_img:
+              cands = sorted(set(sum([glob.glob(os.path.join(root, "game_files", p)) + glob.glob(os.path.join(root, "game_files", "*_build", "nsp", p)) for p in ("*.nsp", "*.NSP", "*.xci", "*.XCI")], [])))
+              base_pkg, upd_pkg, max_v = None, None, -1
+              for pkg in cands:
+                  out_t = subprocess.run([nx_extract, prod_keys, "--contents", pkg], capture_output=True, text=True).stdout
+                  vnum = max([int(t[1:]) for t in out_t.split() if t.startswith("v") and t[1:].isdigit()] + [0])
+                  if vnum > 0 or "Patch" in out_t:
+                      if vnum >= max_v: max_v = vnum; upd_pkg = pkg
+                  elif base_pkg is None or os.path.getsize(pkg) > os.path.getsize(base_pkg):
+                      base_pkg = pkg
+              if base_pkg is None: base_pkg = max(cands, key=os.path.getsize)
+              if upd_pkg == base_pkg: upd_pkg = None
+              stage = os.path.join(root, "vh_stage")
+              shutil.rmtree(stage, ignore_errors=True); os.makedirs(stage, exist_ok=True)
+              subprocess.run([nx_extract, prod_keys, base_pkg, upd_pkg or "-", stage], check=True)
+              s_romfs = next((os.path.join(stage, e) for e in os.listdir(stage) if e.lower() == "romfs"), None)
+              if not s_romfs:
+                  print("[VH ERROR] Extracted stage has no RomFS directory.", file=sys.stderr)
+                  sys.exit(1)
+              ow, add = overlay_tree(vh_romfs_root, s_romfs)
+              print(f"[VH] Overlaid into vh_stage/RomFS: {ow} overwritten, {add} added.")
+              if ow + add == 0:
+                  print("[VH ERROR] No files were overlaid into vh_stage/RomFS.", file=sys.stderr)
+                  sys.exit(1)
+              # Dọn tối đa file tạm, DerivedData, RomFS.img cũ & IPA cũ trước khi đóng gói lại RomFS.img
+              shutil.rmtree(vh_raw, ignore_errors=True)
+              shutil.rmtree(os.path.expanduser("~/Library/Developer/Xcode/DerivedData"), ignore_errors=True)
+              exefs_stage = next((os.path.join(stage, e) for e in os.listdir(stage) if e.lower() == "exefs"), None)
+              if exefs_stage:
+                  shutil.rmtree(exefs_stage, ignore_errors=True)
+              ipa_name = os.environ.get("IPA_NAME", "")
+              if ipa_name:
+                  for p in (os.path.join(root, "out_ipa", ipa_name), os.path.join(root, "out_ipa", ipa_name + ".idx")):
+                      if os.path.isfile(p):
+                          os.remove(p)
+              if os.path.isfile(romfs_img):
+                  os.remove(romfs_img)
+              subprocess.run(["df", "-h", "/"])
+              subprocess.run(["du", "-sh", os.path.join(root, "game_files"), stage, os.path.join(root, "src"), os.path.join(root, "out_ipa")], check=False)
+              subprocess.run([sys.executable, romfs_tool, s_romfs, romfs_img], check=True)
+              shutil.rmtree(stage, ignore_errors=True)
+          else:
+              print("[VH ERROR] Neither romfs dir nor RomFS.img found in extract dir.", file=sys.stderr)
+              sys.exit(1)
+          open(os.path.join(root, ".need_repack"), "w").write("1")
+          PY
+          fi
+
+          if [ -f "$ROOT/.need_repack" ]; then
+            rm -f "$ROOT/out_ipa/$IPA_NAME" "$ROOT/out_ipa/$IPA_NAME.idx"
+            run_nx_build
+          fi
+
+          if [ "$PACK_MODE" = "separate_both" ]; then
+            ROMFS_IMG="$(find "$ROOT/game_files" "$ROOT/src" -maxdepth 6 -type f -iname "RomFS.img" | head -n 1)"
+            if [ -n "$ROMFS_IMG" ]; then mv -f "$ROMFS_IMG" "$ROOT/out_ipa/romfs.img"; fi
+          fi
+
+          # Giải phóng toàn bộ thư mục tạm & DerivedData trước khi giải nén/nén lại IPA gắn credit
+          rm -rf "$ROOT/game_files" "$ROOT/vh_raw" "$ROOT/vh_stage" ~/Library/Developer/Xcode/DerivedData
+          df -h /
+
+          mkdir -p "$ROOT/tmp_ipa"
+          unzip -q "$ROOT/out_ipa/$IPA_NAME" -d "$ROOT/tmp_ipa"
+          PLIST="$(find "$ROOT/tmp_ipa/Payload" -maxdepth 2 -name "Info.plist" | head -n 1)"
+          if [ -n "$PLIST" ]; then
+            /usr/libexec/PlistBuddy -c "Set :NSHumanReadableCopyright $CREDIT_TEXT" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Add :NSHumanReadableCopyright string $CREDIT_TEXT" "$PLIST"
+            rm -f "$ROOT/out_ipa/$IPA_NAME"
+            (cd "$ROOT/tmp_ipa" && zip -qry "$ROOT/out_ipa/$IPA_NAME" Payload)
+          fi
+          rm -rf "$ROOT/tmp_ipa"
+
+          python3 /tmp/miao_live.py "upload" "Tải file lên Gofile" 95 "" "" "Đang upload IPA / RomFS..." || true
+          SERVER="$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')"
+          echo "## Download Links ($PACK_MODE)" >> "$GITHUB_STEP_SUMMARY"
+          for f in "$ROOT/out_ipa"/*; do
+            if [ -f "$f" ] && [[ "$f" != *.idx ]]; then
+              RESP="$(curl -s -F "file=@$f" "https://${SERVER}.gofile.io/contents/uploadfile")"
+              LINK="$(echo "$RESP" | jq -r '.data.downloadPage')"
+              FSIZE="$(ls -lh "$f" | awk '{print $5}')"
+              echo "- **$(basename "$f")** (${FSIZE}): $LINK" >> "$GITHUB_STEP_SUMMARY"
+              echo "Uploaded $(basename "$f") (${FSIZE}) -> $LINK"
             fi
           done
-
-      - name: Lưu dự phòng IPA ở Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: FIFA22_miao-ipa
-          path: out_ipa/FIFA22_miao.ipa
-          retention-days: 3
+          python3 /tmp/miao_live.py "done" "Hoàn tất build" 100 "" "" "Đã tải file lên Gofile thành công!" || true
